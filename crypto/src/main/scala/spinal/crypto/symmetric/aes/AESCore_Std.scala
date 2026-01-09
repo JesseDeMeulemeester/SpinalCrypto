@@ -40,7 +40,7 @@ import spinal.crypto._
   * This design works in encrypt and decrypt and use a key of 128, 192 or 256-bit.
   *
   */
-class AESCore_Std(keyWidth: BitCount) extends Component {
+class AESCore_Std(keyWidth: BitCount, rounds: Int = 0) extends Component {
 
   val gIO  = SymmetricCryptoBlockConfig(
     keyWidth   = keyWidth,
@@ -50,7 +50,7 @@ class AESCore_Std(keyWidth: BitCount) extends Component {
 
   val io = slave(SymmetricCryptoBlockIO(gIO))
 
-  val engine      = new AESEngine_Std(keyWidth)
+  val engine      = new AESEngine_Std(keyWidth, rounds)
   val keySchedule = new AESKeyScheduleCore_Std(keyWidth)
 
   engine.io.engine      <> io
@@ -95,7 +95,7 @@ class AESCore_Std(keyWidth: BitCount) extends Component {
   *               Plaintext
   *
   */
-class AESEngine_Std(keyWidth: BitCount) extends Component {
+class AESEngine_Std(keyWidth: BitCount, rounds: Int = 0) extends Component {
 
   assert(List(128, 192, 256).contains(keyWidth.value), "AES support only 128/192/256 keys width")
 
@@ -118,8 +118,8 @@ class AESEngine_Std(keyWidth: BitCount) extends Component {
   val dataState  = Reg(Vec(Bits(8 bits), 16))
 
   // Count the number of round
-  val nbrRound   = AES.nbrRound(keyWidth)
-  val cntRound   = Reg(UInt(log2Up(nbrRound) bits))
+  val nbrRound   = if (rounds == 0) AES.nbrRound(keyWidth) else rounds
+  val cntRound   = Reg(UInt(log2Up(nbrRound + 1) bits))
 
   /* Key scheduling default value */
   val keyValid    = RegInit(False) clearWhen(io.keySchedule.cmd.ready)
@@ -271,25 +271,22 @@ class AESEngine_Std(keyWidth: BitCount) extends Component {
 
 
   /**
-    * Byte substitution operation (16 clock)
+    * Byte substitution operation (1 clock)
     * 16 identical SBOX
     * newState(i) = SBox(currentState(i))
     */
   val byteSubstitution = new Area {
-
-    val cntByte = Counter(16)
-    sm.byteSub_cmd.ready := cntByte.willOverflowIfInc
-
     when(sm.byteSub_cmd.valid) {
-      cntByte.increment()
-
-      when(io.engine.cmd.enc){
-        dataState(cntByte) := sBoxMem(dataState(cntByte).asUInt)
-      }otherwise{
-        dataState(cntByte) := sBoxMemInv(dataState(cntByte).asUInt)
+      for(i <- 0 until 16) {
+        when(io.engine.cmd.enc){
+          dataState(i) := sBoxMem.readAsync(dataState(i).asUInt, writeFirst)
+        }otherwise{
+          dataState(i) := sBoxMemInv.readAsync(dataState(i).asUInt, writeFirst)
+        }
       }
-    }.otherwise{
-      cntByte.clear()
+      sm.byteSub_cmd.ready := True
+    } otherwise {
+      sm.byteSub_cmd.ready := False
     }
   }
 
@@ -314,7 +311,7 @@ class AESEngine_Std(keyWidth: BitCount) extends Component {
 
 
   /**
-    * Mix Column operation (4 clock) (Galois field multiplication)
+    * Mix Column operation (1 clock) (Galois field multiplication)
     *
     * newState(i) = MixColumn(currentState(i))
     *
@@ -336,27 +333,23 @@ class AESEngine_Std(keyWidth: BitCount) extends Component {
 
     implicit val polyGF8 = p"x^8+x^4+x^3+x+1"
 
-    val cntColumn = Reg(UInt(log2Up(16) bits))
-    sm.mixCol_cmd.ready := cntColumn === 3*4
-
     when(sm.mixCol_cmd.valid){
-
-      when(io.engine.cmd.enc){ // Encryption
-        dataState(0 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x02 ^ GF8(dataState(1 + cntColumn)) * 0x03 ^ GF8(dataState(2 + cntColumn)) * 0x01 ^ GF8(dataState(3 + cntColumn)) * 0x01).toBits()
-        dataState(1 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x01 ^ GF8(dataState(1 + cntColumn)) * 0x02 ^ GF8(dataState(2 + cntColumn)) * 0x03 ^ GF8(dataState(3 + cntColumn)) * 0x01).toBits()
-        dataState(2 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x01 ^ GF8(dataState(1 + cntColumn)) * 0x01 ^ GF8(dataState(2 + cntColumn)) * 0x02 ^ GF8(dataState(3 + cntColumn)) * 0x03).toBits()
-        dataState(3 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x03 ^ GF8(dataState(1 + cntColumn)) * 0x01 ^ GF8(dataState(2 + cntColumn)) * 0x01 ^ GF8(dataState(3 + cntColumn)) * 0x02).toBits()
-      }otherwise{       // Decryption
-        dataState(0 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x0E ^ GF8(dataState(1 + cntColumn)) * 0x0B ^ GF8(dataState(2 + cntColumn)) * 0x0D ^ GF8(dataState(3 + cntColumn)) * 0x09).toBits()
-        dataState(1 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x09 ^ GF8(dataState(1 + cntColumn)) * 0x0E ^ GF8(dataState(2 + cntColumn)) * 0x0B ^ GF8(dataState(3 + cntColumn)) * 0x0D).toBits()
-        dataState(2 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x0D ^ GF8(dataState(1 + cntColumn)) * 0x09 ^ GF8(dataState(2 + cntColumn)) * 0x0E ^ GF8(dataState(3 + cntColumn)) * 0x0B).toBits()
-        dataState(3 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x0B ^ GF8(dataState(1 + cntColumn)) * 0x0D ^ GF8(dataState(2 + cntColumn)) * 0x09 ^ GF8(dataState(3 + cntColumn)) * 0x0E).toBits()
+      for (cntColumn <- 0 until 16 by 4) {
+        when(io.engine.cmd.enc){ // Encryption
+          dataState(0 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x02 ^ GF8(dataState(1 + cntColumn)) * 0x03 ^ GF8(dataState(2 + cntColumn)) * 0x01 ^ GF8(dataState(3 + cntColumn)) * 0x01).toBits()
+          dataState(1 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x01 ^ GF8(dataState(1 + cntColumn)) * 0x02 ^ GF8(dataState(2 + cntColumn)) * 0x03 ^ GF8(dataState(3 + cntColumn)) * 0x01).toBits()
+          dataState(2 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x01 ^ GF8(dataState(1 + cntColumn)) * 0x01 ^ GF8(dataState(2 + cntColumn)) * 0x02 ^ GF8(dataState(3 + cntColumn)) * 0x03).toBits()
+          dataState(3 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x03 ^ GF8(dataState(1 + cntColumn)) * 0x01 ^ GF8(dataState(2 + cntColumn)) * 0x01 ^ GF8(dataState(3 + cntColumn)) * 0x02).toBits()
+        }otherwise{       // Decryption
+          dataState(0 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x0E ^ GF8(dataState(1 + cntColumn)) * 0x0B ^ GF8(dataState(2 + cntColumn)) * 0x0D ^ GF8(dataState(3 + cntColumn)) * 0x09).toBits()
+          dataState(1 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x09 ^ GF8(dataState(1 + cntColumn)) * 0x0E ^ GF8(dataState(2 + cntColumn)) * 0x0B ^ GF8(dataState(3 + cntColumn)) * 0x0D).toBits()
+          dataState(2 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x0D ^ GF8(dataState(1 + cntColumn)) * 0x09 ^ GF8(dataState(2 + cntColumn)) * 0x0E ^ GF8(dataState(3 + cntColumn)) * 0x0B).toBits()
+          dataState(3 + cntColumn) := (GF8(dataState(0 + cntColumn)) * 0x0B ^ GF8(dataState(1 + cntColumn)) * 0x0D ^ GF8(dataState(2 + cntColumn)) * 0x09 ^ GF8(dataState(3 + cntColumn)) * 0x0E).toBits()
+        }
       }
-
-      cntColumn := cntColumn + 4
-
-    }otherwise{
-      cntColumn := 0
+      sm.mixCol_cmd.ready := True
+    } otherwise {
+      sm.mixCol_cmd.ready := False
     }
   }
 }
